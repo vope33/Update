@@ -1,0 +1,185 @@
+# Obtenez tous les périphériques
+$devices = Get-PnpDevice
+
+# Créer une liste pour stocker les informations des périphériques
+$deviceList = @()
+
+# Parcourez chaque périphérique et ajoutez ses informations à la liste
+foreach ($device in $devices) {
+    if ($device.Present -eq $true -and $device.Manufacturer -ne "Microsoft") {
+        # Obtenir les identifiants principaux
+        $DeviceId = (Get-PnpDeviceProperty -InstanceId $device.InstanceId -KeyName 'DEVPKEY_Device_MatchingDeviceId').Data
+        $HardwareId = $device.HardwareID[0]
+
+        # Obtenir les propriétés supplémentaires
+        $driverProperties = Get-PnpDeviceProperty -InstanceId $device.InstanceId
+        $DriverVersion = ($driverProperties | Where-Object { $_.KeyName -eq "DEVPKEY_Device_DriverVersion" }).Data
+        $DriverProvider = ($driverProperties | Where-Object { $_.KeyName -eq "DEVPKEY_Device_DriverProvider" }).Data
+
+        # Gérer la date du pilote
+        $DriverDateRaw = ($driverProperties | Where-Object { $_.KeyName -eq "DEVPKEY_Device_DriverDate" }).Data
+        if ($DriverDateRaw -is [DateTime]) {
+            $DriverDate = $DriverDateRaw
+        } elseif ($DriverDateRaw) {
+            try {
+                $DriverDate = [datetime]::FromFileTimeUtc([int64]$DriverDateRaw)
+            } catch {
+                $DriverDate = $null
+            }
+        } else {
+            $DriverDate = $null
+        }
+
+        # Remplacer les caractères spéciaux dans MatchingDeviceId
+        $EncodedDeviceId = $DeviceId -replace "\\", "%5C" -replace "&", "%26"
+
+        # Construire les liens hypertexte
+       $SearchUrlCatalog = "https://www.catalog.update.microsoft.com/Search.aspx?q=" + $EncodedDeviceId + "+2025&scol=DateComputed&sdir=desc"
+# $SearchUrlCatalog = "https://www.catalog.update.microsoft.com/Search.aspx?q=" + $EncodedDeviceId + "+Windows+11+Client%2C+version+24H2&scol=DateComputed&sdir=desc"
+        $SearchUrlDrvHub = "https://fr.drvhub.net/search?q=$EncodedDeviceId"
+
+        # Créer un objet contenant les informations collectées
+        $deviceInfo = [PSCustomObject]@{
+            "Device Name"      = $device.FriendlyName
+            "MatchingDeviceId" = $DeviceId
+            "Hardware ID"      = $HardwareId
+            "Driver Version"   = $DriverVersion
+            "Driver Provider"  = $DriverProvider
+            "Driver Date"      = $DriverDate
+            "Update Catalog"   = $SearchUrlCatalog
+            "DrvHub Search"    = $SearchUrlDrvHub
+            "Latest Version"   = ""
+            "Catalog Date"     = ""
+            "Catalog Package"  = ""
+        }
+
+        # Ajouter l'objet à la liste des périphériques
+        $deviceList += $deviceInfo
+    }
+}
+
+# Exporter la liste des périphériques dans un fichier CSV
+$csvPath = "C:\Users\33663\Desktop\Pdt.csv"
+$deviceList | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -Delimiter ';'
+
+# Ouvrir le fichier dans Excel et activer les filtres
+$excel = New-Object -ComObject Excel.Application
+$workbook = $excel.Workbooks.Open($csvPath)
+$worksheet = $workbook.Sheets.Item(1)
+$usedRange = $worksheet.UsedRange
+$lastColumn = $usedRange.Columns.Count
+
+
+
+
+# Appliquer les filtres
+$worksheet.Range($worksheet.Cells(1, 1), $worksheet.Cells(1, $lastColumn)).AutoFilter()
+$worksheet.Range("A1").AutoFilter(5, "<>Microsoft")  # Colonne E
+$worksheet.Range("A1").AutoFilter(4, "<>")           # Colonne D
+$usedRange.Columns.AutoFit()
+
+# Récupérer les infos depuis Update Catalog (col. G) et remplir les colonnes I, J, K
+$row = 2
+while ($true) {
+    $url = $worksheet.Cells.Item($row, 7).Value2  # Colonne G : Update Catalog
+
+    if (-not $url) { break }
+
+    # Lancer IE
+    $ie = New-Object -ComObject "InternetExplorer.Application"
+    $ie.Visible = $false
+    $ie.Navigate($url)
+
+    # Attendre le chargement
+    $timeout = 0
+    while ($ie.Busy -eq $true -or $ie.ReadyState -ne 4) {
+        Start-Sleep -Milliseconds 500
+        $timeout += 1
+        if ($timeout -gt 30) { break }
+    }
+
+    $version = "Non trouvé"
+    $pubDate = ""
+    $packageName = ""
+
+    try {
+        $doc = $ie.Document
+        $tables = $doc.getElementsByTagName("table")
+        foreach ($table in $tables) {
+            if ($table.rows.length -gt 1 -and $table.rows.item(1).cells.length -ge 5) {
+                $version = $table.rows.item(1).cells.item(1).innerText.Trim()       # Col. 1 → I
+                $packageName = $table.rows.item(1).cells.item(4).innerText.Trim()   # Col. 4 → K
+                $pubDate = $table.rows.item(1).cells.item(5).innerText.Trim()       # Col. 5 → J
+                break
+            }
+        }
+    } catch {
+        $version = "Erreur"
+    }
+
+    # Écrire dans les colonnes I (9), J (10), K (11)
+    $worksheet.Cells.Item($row, 9).Value2 = $version
+$worksheet.Cells.Item($row, 10).Value2 = $pubDate
+# Si la date du catalogue est "n.a.", remplacer par la partie après le dernier tiret de la colonne I
+if ($pubDate -eq "n.a.") {
+    $versionText = $worksheet.Cells.Item($row, 9).Value2  # Colonne I
+
+    if ($versionText -ne $null -and $versionText.Contains("-")) {
+        $splitParts = $versionText -split "-"
+        $lastPart = $splitParts[-1].Trim()
+        $worksheet.Cells.Item($row, 10).Value2 = $lastPart
+    }
+}
+
+
+    $worksheet.Cells.Item($row, 11).Value2 = $packageName
+
+    # Nettoyer IE
+    $ie.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($ie) | Out-Null
+
+    $row++
+}
+
+
+# Comparer les dates (F et K) et écrire "TOP" dans la colonne L si K > F
+$row = 2
+while ($true) {
+    $driverDate = $worksheet.Cells.Item($row, 6).Value2  # Colonne F
+    $catalogDateStr = $worksheet.Cells.Item($row, 11).Value2  # Colonne K
+
+    if (-not $worksheet.Cells.Item($row, 1).Value2) { break }
+
+    if ($driverDate -and $catalogDateStr) {
+        try {
+            $catalogDate = [datetime]::ParseExact($catalogDateStr, 'dd/MM/yyyy', $null)
+            $driverDateDT = [datetime]::FromOADate($driverDate)
+
+            if ($catalogDate -gt $driverDateDT) {
+                $worksheet.Cells.Item($row, 12).Value2 = "TOP"  # Colonne L
+            }
+        } catch {
+            # Ignore si échec parsing
+        }
+    }
+
+    $row++
+}
+
+$excel.Visible = $true
+$worksheet.Cells.Item(1,1).Select()
+
+# Masquer les colonnes E à I
+$Worksheet.Range("E:I").EntireColumn.Hidden = $true
+
+
+
+
+
+# Sauvegarder et libérer
+$workbook.Save()
+$null = [System.Runtime.InteropServices.Marshal]::ReleaseComObject($worksheet)
+$null = [System.Runtime.InteropServices.Marshal]::ReleaseComObject($workbook)
+$null = [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel)
+[GC]::Collect()
+[GC]::WaitForPendingFinalizers()
